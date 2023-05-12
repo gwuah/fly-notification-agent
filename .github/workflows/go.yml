@@ -1,5 +1,5 @@
 
-name: goreleaser
+name: continous-integration
 on:
   push:
     branches:
