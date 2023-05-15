@@ -28,3 +28,12 @@ add this to your machine config
     "cmd": ["~/.fly/fly-notification-agent", "--webhook", "<insert-your-webhook-url>]
 }
 ```
+
+# process (for me so i don't forget because i can't do anything right)
+it's a bit weird but
+- make changes
+- GOOS=linux GOARCH=amd64 go build main.go
+- git tag v0.0.4
+- update public/install.sh to point to new version
+- git push origin --tags
+- fly deploy
