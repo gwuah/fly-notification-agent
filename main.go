@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
@@ -22,41 +25,15 @@ var (
 	appName        = os.Getenv("FLY_APP_NAME")
 )
 
-type Event[T any] struct {
+type Data struct {
+	MachineID string `json:"machine_id"`
+	AppName   string `json:"app_name"`
+	At        int64  `json:"at"`
+}
+
+type Event struct {
 	Type string `json:"type"`
-	Data T      `json:"data"`
-}
-
-func deliver(ctx context.Context, url string, events <-chan []byte) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case event := <-events:
-			r, err := http.NewRequest("POST", url, bytes.NewBuffer(event))
-			if err != nil {
-				logger.WithError(err).Error("failed to deliver machine event to webhook")
-			}
-			r.Header.Add("Content-Type", "application/json")
-
-			client := &http.Client{}
-			res, err := client.Do(r)
-			if err != nil {
-				logger.WithError(err).Error("failed to deliver machine event to webhook")
-			}
-			res.Body.Close()
-		}
-
-	}
-}
-
-func generateEvent[T any](name string, e Event[T]) []byte {
-	body, err := json.Marshal(e)
-	if err != nil {
-		logger.WithError(err).Errorf("failed to marshal %f event", name)
-		return []byte("")
-	}
-	return body
+	Data Data   `json:"data"`
 }
 
 func main() {
@@ -80,16 +57,18 @@ func main() {
 
 			go func() {
 				<-sigChan
-				events <- generateEvent("machine_stopped", Event[int]{})
+				events <- generateEvent("machine_stopped")
 				cancel()
 			}()
 
 			logger = logger.WithField("machine", machineID).WithField("machine_version", machineVersion).WithField("app_id", appName).WithField("app_name", appName).WithField("url", url)
 			logger.Info("Starting fly-notification-agent...")
 
-			events <- generateEvent("machine_started", Event[int]{})
+			events <- generateEvent("machine_started")
 
-			return deliver(ctx, url, events)
+			go oomChecker(ctx, events)
+
+			return deliverWebhooks(ctx, url, events)
 		},
 	}
 
@@ -98,4 +77,85 @@ func main() {
 		log.Fatal(err)
 	}
 	logger.Infof("fly-notification-agent is done")
+}
+
+func generateEvent(name string) []byte {
+	e := Event{
+		Type: name,
+		Data: Data{
+			MachineID: machineID,
+			AppName:   appName,
+			At:        time.Now().Unix(),
+		},
+	}
+	body, err := json.Marshal(e)
+	if err != nil {
+		logger.WithError(err).Errorf("failed to marshal %f event", name)
+		return []byte("")
+	}
+	return body
+}
+
+func oomChecker(ctx context.Context, events chan []byte) {
+	reportedOOMs := map[string]struct{}{}
+	ticker := time.NewTicker(10 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+
+			file, err := os.Open("/dev/kmsg")
+			if err != nil {
+				logger.WithError(err).Errorf("failed to open file")
+				continue
+			}
+
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				text := scanner.Text()
+				if strings.Contains(text, "Killed process") {
+					if _, ok := reportedOOMs[text]; !ok {
+						events <- generateEvent("oom")
+						reportedOOMs[text] = struct{}{}
+					}
+				}
+			}
+
+			file.Close()
+
+			if err := scanner.Err(); err != nil {
+				logger.WithError(err).Errorf("failed to scan file")
+			}
+
+		}
+	}
+}
+
+func deliverWebhooks(ctx context.Context, url string, events <-chan []byte) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case event := <-events:
+			if len(event) == 0 {
+				continue
+			}
+
+			r, err := http.NewRequest("POST", url, bytes.NewBuffer(event))
+			if err != nil {
+				logger.WithError(err).Error("failed to deliver event")
+			}
+			r.Header.Add("Content-Type", "application/json")
+
+			client := &http.Client{}
+			res, err := client.Do(r)
+			if err != nil {
+				logger.WithError(err).Error("failed to deliver event")
+				continue
+			}
+			res.Body.Close()
+		}
+
+	}
 }
